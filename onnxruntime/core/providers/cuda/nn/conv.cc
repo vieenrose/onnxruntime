@@ -10,6 +10,7 @@
 #include "core/providers/cuda/nn/conv.h"
 #include "core/common/span_utils.h"
 #include "core/providers/cuda/cuda_common.h"
+#include "core/providers/cuda/shared_inc/fpgeneric.h"  // cublasGemmHelper (cuDNN-free conv)
 #include "core/providers/cuda/tensor/transpose.h"
 #include "core/providers/cuda/shared_inc/cudnn_fe_call.h"
 
@@ -455,8 +456,91 @@ Status Conv<T, Layout>::UpdateState(OpKernelContext* context, bool bias_expected
   return Status::OK();
 }
 
+// cuDNN-free conv launchers (defined in conv_nocudnn.cu) — Jetson Nano gen1 fork.
+template <typename U>
+void Im2colNCHWLauncher(cudaStream_t, const U*, int, int, int, int, int, int, int, int, int,
+                        int, int, int, int, U*);
+template <typename U>
+void AddBiasNCHWLauncher(cudaStream_t, U*, const U*, int, int);
+
 template <typename T, bool Layout>
 Status Conv<T, Layout>::ComputeInternal(OpKernelContext* context) const {
+#if defined(ORT_CUDA_NO_CUDNN_CONV)
+  if constexpr (Layout == LAYOUT_NCHW) {
+    const Tensor* X = context->Input<Tensor>(0);
+    const Tensor* W = context->Input<Tensor>(1);
+    const Tensor* B = context->InputCount() >= 3 ? context->Input<Tensor>(2) : nullptr;
+    const TensorShape& x_shape = X->Shape();
+    const TensorShape& w_shape = W->Shape();
+    const int64_t kernel_rank = static_cast<int64_t>(x_shape.NumDimensions()) - 2;
+    if (kernel_rank == 1 || kernel_rank == 2) {
+      TensorShapeVector kernel_shape;
+      ORT_RETURN_IF_ERROR(conv_attrs_.ComputeKernelShape(w_shape, kernel_shape));
+      ConvPadVector pads(conv_attrs_.pads);
+      if (pads.empty()) pads.resize(kernel_rank * 2, 0);
+      TensorShapeVector dilations(conv_attrs_.dilations);
+      if (dilations.empty()) dilations.resize(kernel_rank, 1);
+      TensorShapeVector strides(conv_attrs_.strides);
+      if (strides.empty()) strides.resize(kernel_rank, 1);
+      const int64_t N = x_shape[0];
+      const int64_t C = x_shape[1];
+      const int64_t M = w_shape[0];
+      const int64_t group = conv_attrs_.group;
+      TensorShapeVector y_dims{N, M};
+      TensorShape spatial = x_shape.Slice(2);
+      ORT_RETURN_IF_ERROR(conv_attrs_.InferPadsAndOutputShape(spatial, kernel_shape, strides,
+                                                              dilations, pads, y_dims));
+      Tensor* Y = context->Output(0, TensorShape(y_dims));
+      if (Y->Shape().Size() == 0) return Status::OK();
+      int H, Wd, kH, kW, padH, padW, strH, strW, dilH, dilW, outH, outW;
+      if (kernel_rank == 2) {
+        H = (int)spatial[0]; Wd = (int)spatial[1];
+        kH = (int)kernel_shape[0]; kW = (int)kernel_shape[1];
+        padH = (int)pads[0]; padW = (int)pads[1];
+        strH = (int)strides[0]; strW = (int)strides[1];
+        dilH = (int)dilations[0]; dilW = (int)dilations[1];
+        outH = (int)y_dims[2]; outW = (int)y_dims[3];
+      } else {  // Conv1d -> (H=1, W=L)
+        H = 1; Wd = (int)spatial[0];
+        kH = 1; kW = (int)kernel_shape[0];
+        padH = 0; padW = (int)pads[0];
+        strH = 1; strW = (int)strides[0];
+        dilH = 1; dilW = (int)dilations[0];
+        outH = 1; outW = (int)y_dims[2];
+      }
+      const int Cg = (int)(C / group), Mg = (int)(M / group);
+      const int K = Cg * kH * kW, outHW = outH * outW;
+      auto col = GetScratchBuffer<CudaT>(static_cast<size_t>(K) * outHW, context->GetComputeStream());
+      cudaStream_t stream = Stream(context);
+      cublasHandle_t cublas = GetCublasHandle(context);
+      const CudaT* xdata = reinterpret_cast<const CudaT*>(X->Data<T>());
+      const CudaT* wdata = reinterpret_cast<const CudaT*>(W->Data<T>());
+      CudaT* ydata = reinterpret_cast<CudaT*>(Y->MutableData<T>());
+      const CudaT one = onnxruntime::cuda::Consts<CudaT>::One;
+      const CudaT zero = onnxruntime::cuda::Consts<CudaT>::Zero;
+      for (int64_t n = 0; n < N; ++n) {
+        for (int64_t g = 0; g < group; ++g) {
+          const CudaT* xg = xdata + ((n * C) + g * Cg) * static_cast<int64_t>(H) * Wd;
+          const CudaT* wg = wdata + g * static_cast<int64_t>(Mg) * K;
+          CudaT* yg = ydata + ((n * M) + g * Mg) * static_cast<int64_t>(outHW);
+          Im2colNCHWLauncher<CudaT>(stream, xg, Cg, H, Wd, kH, kW, padH, padW, strH, strW,
+                                    dilH, dilW, outH, outW, col.get());
+          // row-major Y[Mg,outHW] = W[Mg,K] @ col[K,outHW]
+          CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(cublas, CUBLAS_OP_N, CUBLAS_OP_N, outHW, Mg, K,
+                                                  &one, col.get(), outHW, wg, K, &zero, yg, outHW,
+                                                  GetDeviceProp(), false));
+        }
+      }
+      if (B != nullptr) {
+        const CudaT* bdata = reinterpret_cast<const CudaT*>(B->Data<T>());
+        for (int64_t n = 0; n < N; ++n)
+          AddBiasNCHWLauncher<CudaT>(stream, ydata + n * M * static_cast<int64_t>(outHW), bdata,
+                                     (int)M, outHW);
+      }
+      return Status::OK();
+    }
+  }
+#endif
   std::lock_guard<std::mutex> lock(s_.mutex);
   ORT_RETURN_IF_ERROR(UpdateState(context));
   if (s_.Y->Shape().Size() == 0) {
