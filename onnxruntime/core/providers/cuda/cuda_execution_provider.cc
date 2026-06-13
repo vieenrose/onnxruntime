@@ -177,9 +177,11 @@ CUDAExecutionProvider::PerThreadContext::PerThreadContext(OrtDevice::DeviceId de
   CUBLAS_CALL_THROW(cublasLtCreate(&cublas_lt_handle_));
   CUBLAS_CALL_THROW(cublasSetStream(cublas_handle_, stream));
 
+#ifndef ORT_CUDA_NO_CUDNN  // skip cuDNN handle (keep cuBLAS) — cuDNN-free CUDA EP for low-RAM devices
   CUDNN_CALL_THROW(cudnnCreate(&cudnn_handle_));
   CUDNN_CALL_THROW(cudnnSetStream(cudnn_handle_, stream));
   LOGS_DEFAULT(INFO) << "cuDNN version: " << cudnnGetVersion();
+#endif
 #endif
   cuda_graph_.SetStream(stream);
 }
@@ -188,7 +190,9 @@ CUDAExecutionProvider::PerThreadContext::~PerThreadContext() {
 #ifndef USE_CUDA_MINIMAL
   ORT_IGNORE_RETURN_VALUE(CUBLAS_CALL(cublasDestroy(cublas_handle_)));
   ORT_IGNORE_RETURN_VALUE(CUBLAS_CALL(cublasLtDestroy(cublas_lt_handle_)));
+#ifndef ORT_CUDA_NO_CUDNN
   ORT_IGNORE_RETURN_VALUE(CUDNN_CALL(cudnnDestroy(cudnn_handle_)));
+#endif
 #endif
 }
 

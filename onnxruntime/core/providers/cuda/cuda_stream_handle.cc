@@ -73,13 +73,19 @@ CudaStream::CudaStream(cudaStream_t stream,
   if (own_flag) {
     CUBLAS_CALL_THROW(cublasCreate(&cublas_handle_));
     CUBLAS_CALL_THROW(cublasSetStream(cublas_handle_, stream));
+#ifndef ORT_CUDA_NO_CUDNN  // skip cuDNN handle (keep cuBLAS) — cuDNN-free CUDA EP for low-RAM devices
     CUDNN_CALL_THROW(cudnnCreate(&cudnn_handle_));
     CUDNN_CALL_THROW(cudnnSetStream(cudnn_handle_, stream));
+#endif
   } else {
     cublas_handle_ = external_cublas_handle;
     CUBLAS_CALL_THROW(cublasSetStream(cublas_handle_, stream));
+#ifndef ORT_CUDA_NO_CUDNN
     cudnn_handle_ = external_cudnn_handle;
     CUDNN_CALL_THROW(cudnnSetStream(cudnn_handle_, stream));
+#else
+    (void)external_cudnn_handle;
+#endif
   }
 #else
   (void)(external_cudnn_handle);
@@ -92,7 +98,9 @@ CudaStream::~CudaStream() {
 #ifndef USE_CUDA_MINIMAL
   if (own_stream_) {
     cublasDestroy(cublas_handle_);
+#ifndef ORT_CUDA_NO_CUDNN
     cudnnDestroy(cudnn_handle_);
+#endif
     auto* handle = GetHandle();
     if (handle)
       cudaStreamDestroy(static_cast<cudaStream_t>(handle));
