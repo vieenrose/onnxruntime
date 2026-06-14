@@ -16,4 +16,7 @@ except ImportError:
 import importlib.util  # noqa
 have_torch = importlib.util.find_spec("torch")
 if have_torch:
-    from .pytorch_export_helpers import infer_input_info
+    try:
+        from .pytorch_export_helpers import infer_input_info
+    except Exception:  # torch present but unimportable (e.g. missing CUDA libs); not needed for C++ build
+        infer_input_info = None
