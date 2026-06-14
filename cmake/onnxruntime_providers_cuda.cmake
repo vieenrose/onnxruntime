@@ -225,6 +225,10 @@
     endif()
 
     add_dependencies(${target} onnxruntime_providers_shared ${onnxruntime_EXTERNAL_DEPENDENCIES})
+    if(onnxruntime_CUDA_NO_CUDNN)
+      # cuBLAS-only CUDA EP: cuDNN-free Conv/ConvTranspose, RNN/GRU/LSTM -> CPU EP, skip cudnnCreate.
+      target_compile_definitions(${target} PRIVATE ORT_CUDA_NO_CUDNN ORT_CUDA_NO_CUDNN_CONV)
+    endif()
     if(onnxruntime_CUDA_MINIMAL)
       target_compile_definitions(${target} PRIVATE USE_CUDA_MINIMAL)
       target_link_libraries(${target} PRIVATE ${ABSEIL_LIBS} ${ONNXRUNTIME_PROVIDERS_SHARED} Boost::mp11 safeint_interface CUDA::cudart)

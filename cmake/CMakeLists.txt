@@ -73,6 +73,7 @@ cmake_dependent_option(onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS "Build with CUD
 
 cmake_dependent_option(onnxruntime_USE_CUDA_NHWC_OPS "Build CUDA with NHWC op support" ON "onnxruntime_USE_CUDA" OFF)
 option(onnxruntime_CUDA_MINIMAL "Build CUDA without any operations apart from memcpy ops. Usefuel for a very minial TRT build" OFF)
+option(onnxruntime_CUDA_NO_CUDNN "Build the CUDA EP cuDNN-free (cuBLAS-only Conv/ConvTranspose, RNN->CPU, skip cudnnCreate). For low-RAM devices e.g. Jetson Nano gen1." OFF)
 option(onnxruntime_ENABLE_CUDA_LINE_NUMBER_INFO "When building with CUDA support, generate device code line number information." OFF)
 option(onnxruntime_USE_OPENVINO "Build with OpenVINO support" OFF)
 option(onnxruntime_USE_COREML "Build with CoreML support" OFF)
