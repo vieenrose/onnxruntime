@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "conv_transpose.h"
+#include "core/providers/cuda/shared_inc/fpgeneric.h"  // cublasGemmHelper (cuDNN-free convtranspose)
 #include "core/providers/cuda/tensor/transpose.h"
 
 #if CUDNN_MAJOR < 9
@@ -499,8 +500,80 @@ Status ConvTranspose<T, Layout>::DoConvTranspose(OpKernelContext* context, bool 
 }
 #endif
 
+// cuDNN-free convtranspose launchers (defined in conv_nocudnn.cu) — Jetson Nano gen1 fork.
+// signature: (stream, col, channels, img_h, img_w, col_h, col_w, kh, kw, pad_t, pad_l,
+//             stride_h, stride_w, dil_h, dil_w, im)  -> 13 ints
+template <typename U>
+void Col2imNCHWLauncher(cudaStream_t, const U*, int, int, int, int, int, int, int, int, int, int,
+                        int, int, int, U*);
+template <typename U>
+void AddBiasNCHWLauncher(cudaStream_t, U*, const U*, int, int);
+
 template <typename T, bool Layout>
 Status ConvTranspose<T, Layout>::ComputeInternal(OpKernelContext* context) const {
+#if defined(ORT_CUDA_NO_CUDNN_CONV)
+  if constexpr (Layout == LAYOUT_NCHW) {
+    const bool has_bias = context->InputCount() >= 3;
+    typename ConvTransposeAttributes::Prepare p;
+    ORT_RETURN_IF_ERROR(conv_transpose_attrs_.PrepareForCompute(context, has_bias, p, false));
+    const int krank = static_cast<int>(p.kernel_shape.size());
+    if (p.Y->Shape().Size() != 0 && (krank == 1 || krank == 2)) {
+      const int64_t group = conv_transpose_attrs_.group;
+      const int Cin_g = static_cast<int>(p.num_input_channels / group);
+      const int Cout_g = static_cast<int>(p.num_output_channels / group);
+      int H, Wd, kH, kW, padT, padL, strH, strW, dilH, dilW, outH, outW;
+      if (krank == 2) {
+        H = (int)p.input_shape[0]; Wd = (int)p.input_shape[1];
+        kH = (int)p.kernel_shape[0]; kW = (int)p.kernel_shape[1];
+        padT = (int)p.pads[0]; padL = (int)p.pads[1];
+        strH = (int)p.strides[0]; strW = (int)p.strides[1];
+        dilH = (int)p.dilations[0]; dilW = (int)p.dilations[1];
+        outH = (int)p.Y->Shape()[2]; outW = (int)p.Y->Shape()[3];
+      } else {  // ConvTranspose1d -> (H=1, W=L)
+        H = 1; Wd = (int)p.input_shape[0];
+        kH = 1; kW = (int)p.kernel_shape[0];
+        padT = 0; padL = (int)p.pads[0];
+        strH = 1; strW = (int)p.strides[0];
+        dilH = 1; dilW = (int)p.dilations[0];
+        outH = 1; outW = (int)p.Y->Shape()[2];
+      }
+      const int input_image_size = H * Wd;
+      const int kernel_dim = Cout_g * kH * kW;
+      auto col = GetScratchBuffer<CudaT>(static_cast<size_t>(kernel_dim) * input_image_size,
+                                         context->GetComputeStream());
+      cudaStream_t stream = Stream(context);
+      cublasHandle_t cublas = GetCublasHandle(context);
+      const CudaT* xdata = reinterpret_cast<const CudaT*>(p.X->Data<T>());
+      const CudaT* fdata = reinterpret_cast<const CudaT*>(p.F->Data<T>());
+      CudaT* ydata = reinterpret_cast<CudaT*>(p.Y->MutableData<T>());
+      CUDA_RETURN_IF_ERROR(cudaMemsetAsync(ydata, 0, p.Y->Shape().Size() * sizeof(CudaT), stream));
+      const CudaT one = onnxruntime::cuda::Consts<CudaT>::One;
+      const CudaT zero = onnxruntime::cuda::Consts<CudaT>::Zero;
+      for (int64_t n = 0; n < p.N; ++n) {
+        for (int64_t g = 0; g < group; ++g) {
+          const CudaT* xg = xdata + (n * p.num_input_channels + g * Cin_g) * (int64_t)input_image_size;
+          const CudaT* fg = fdata + g * (int64_t)Cin_g * kernel_dim;
+          CudaT* yg = ydata + (n * p.num_output_channels + g * Cout_g) * (int64_t)outH * outW;
+          // ORT CPU: Gemm(Trans, NoTrans, kernel_dim, input_image_size, Cin_g, filter, X) -> col
+          // row-major col[kernel_dim, input_image_size] = filter^T @ X
+          CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                                                  input_image_size, kernel_dim, Cin_g, &one,
+                                                  xg, input_image_size, fg, kernel_dim, &zero,
+                                                  col.get(), input_image_size, GetDeviceProp(), false));
+          Col2imNCHWLauncher<CudaT>(stream, col.get(), Cout_g, outH, outW, H, Wd, kH, kW,
+                                    padT, padL, strH, strW, dilH, dilW, yg);
+        }
+      }
+      if (p.B != nullptr) {
+        const CudaT* bdata = reinterpret_cast<const CudaT*>(p.B->Data<T>());
+        for (int64_t n = 0; n < p.N; ++n)
+          AddBiasNCHWLauncher<CudaT>(stream, ydata + n * p.num_output_channels * (int64_t)outH * outW,
+                                     bdata, (int)p.num_output_channels, outH * outW);
+      }
+      return Status::OK();
+    }
+  }
+#endif
   return DoConvTranspose(context, false);
 }
 

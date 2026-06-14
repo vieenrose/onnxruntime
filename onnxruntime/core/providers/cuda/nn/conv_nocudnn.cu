@@ -50,6 +50,54 @@ __global__ void AddBiasNCHWKernel(const int n, T* y, const T* bias, const int ou
   }
 }
 
+// Caffe-style col2im (scatter-add): the reverse of im2col, for ConvTranspose.
+// col is [channels*kH*kW, col_h*col_w]; accumulates into data_im [channels, img_h, img_w].
+// img_* = output (Y) spatial; col_* = input (X) spatial. data_im must be pre-zeroed.
+template <typename T>
+__global__ void Col2imNCHWKernel(const int n, const T* data_col,
+                                 const int img_h, const int img_w, const int kh, const int kw,
+                                 const int pad_t, const int pad_l, const int stride_h, const int stride_w,
+                                 const int dil_h, const int dil_w, const int col_h, const int col_w,
+                                 T* data_im) {
+  for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < n;
+       index += blockDim.x * gridDim.x) {
+    T val = T(0);
+    const int w_im = index % img_w + pad_l;
+    const int h_im = (index / img_w) % img_h + pad_t;
+    const int c = index / (img_w * img_h);
+    const int kext_w = (kw - 1) * dil_w + 1;
+    const int kext_h = (kh - 1) * dil_h + 1;
+    const int w_col_start = (w_im < kext_w) ? 0 : (w_im - kext_w) / stride_w + 1;
+    const int w_col_end = min(w_im / stride_w + 1, col_w);
+    const int h_col_start = (h_im < kext_h) ? 0 : (h_im - kext_h) / stride_h + 1;
+    const int h_col_end = min(h_im / stride_h + 1, col_h);
+    for (int h_col = h_col_start; h_col < h_col_end; ++h_col) {
+      for (int w_col = w_col_start; w_col < w_col_end; ++w_col) {
+        int h_k = h_im - h_col * stride_h;
+        int w_k = w_im - w_col * stride_w;
+        if (h_k % dil_h == 0 && w_k % dil_w == 0) {
+          h_k /= dil_h; w_k /= dil_w;
+          const int col_idx = (((c * kh + h_k) * kw + w_k) * col_h + h_col) * col_w + w_col;
+          val += data_col[col_idx];
+        }
+      }
+    }
+    data_im[index] = data_im[index] + val;
+  }
+}
+
+template <typename T>
+void Col2imNCHWLauncher(cudaStream_t stream, const T* data_col, int channels, int img_h, int img_w,
+                        int col_h, int col_w, int kh, int kw, int pad_t, int pad_l, int stride_h,
+                        int stride_w, int dil_h, int dil_w, T* data_im) {
+  const int n = channels * img_h * img_w;
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  Col2imNCHWKernel<T><<<blocks, threads, 0, stream>>>(
+      n, data_col, img_h, img_w, kh, kw, pad_t, pad_l, stride_h, stride_w, dil_h, dil_w,
+      col_h, col_w, data_im);
+}
+
 template <typename T>
 void Im2colNCHWLauncher(cudaStream_t stream, const T* data_im, int channels, int height,
                         int width, int kh, int kw, int pad_h, int pad_w, int stride_h,
@@ -80,6 +128,12 @@ template void AddBiasNCHWLauncher<half>(cudaStream_t, half*, const half*, int, i
 template void Im2colNCHWLauncher<double>(cudaStream_t, const double*, int, int, int, int, int,
                                          int, int, int, int, int, int, int, int, double*);
 template void AddBiasNCHWLauncher<double>(cudaStream_t, double*, const double*, int, int);
+template void Col2imNCHWLauncher<float>(cudaStream_t, const float*, int, int, int, int, int, int,
+                                        int, int, int, int, int, int, int, float*);
+template void Col2imNCHWLauncher<half>(cudaStream_t, const half*, int, int, int, int, int, int,
+                                       int, int, int, int, int, int, int, half*);
+template void Col2imNCHWLauncher<double>(cudaStream_t, const double*, int, int, int, int, int, int,
+                                         int, int, int, int, int, int, int, double*);
 
 }  // namespace cuda
 }  // namespace onnxruntime
