@@ -486,10 +486,18 @@ Status Conv<T, Layout>::ComputeInternal(OpKernelContext* context) const {
       const int64_t C = x_shape[1];
       const int64_t M = w_shape[0];
       const int64_t group = conv_attrs_.group;
-      TensorShapeVector y_dims{N, M};
       TensorShape spatial = x_shape.Slice(2);
-      ORT_RETURN_IF_ERROR(conv_attrs_.InferPadsAndOutputShape(spatial, kernel_shape, strides,
-                                                              dilations, pads, y_dims));
+      // Per-dim begin/end pad + output, handling auto_pad and asymmetric / TF-"SAME" padding
+      // directly (im2col uses the begin pad), so depthwise/separable TF-exported convs work too.
+      TensorShapeVector y_dims{N, M};
+      for (size_t d = 0; d < kernel_rank; ++d) {
+        int64_t ph = pads[d], pt = pads[kernel_rank + d], od = 0;
+        ORT_RETURN_IF_ERROR(ComputePadAndOutputShape(spatial[d], strides[d], kernel_shape[d],
+                                                     dilations[d], conv_attrs_.auto_pad, ph, pt, od, false));
+        pads[d] = ph;
+        pads[kernel_rank + d] = pt;
+        y_dims.push_back(od);
+      }
       Tensor* Y = context->Output(0, TensorShape(y_dims));
       if (Y->Shape().Size() == 0) return Status::OK();
       int H, Wd, kH, kW, padH, padW, strH, strW, dilH, dilW, outH, outW;
