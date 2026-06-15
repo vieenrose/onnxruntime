@@ -85,7 +85,15 @@ Status CudnnDataTensor::Set(cudnnDataType_t dataType,
 }
 
 CudnnFilterDescriptor::CudnnFilterDescriptor() : desc_(nullptr) {
+#ifndef ORT_CUDA_NO_CUDNN
+  // cuDNN-free build (Jetson Nano gen1): the Conv kernel keeps a CudnnConvState
+  // member whose CudnnFilterDescriptor is default-constructed for every Conv,
+  // even though the im2col+cuBLAS path never uses it. Creating the descriptor
+  // here calls into cuDNN and aborts when cuDNN is absent. Stay lazy (desc_ is
+  // created on demand in Set(), which the cuDNN-free path never reaches); the
+  // dtor already no-ops on a null desc_.
   cudnnCreateFilterDescriptor(&desc_);
+#endif
 }
 
 CudnnFilterDescriptor::~CudnnFilterDescriptor() {
